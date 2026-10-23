@@ -1,6 +1,6 @@
 # ResQNow
 
-ResQNow is a Flask + SQLite prototype for coordinating verified ambulance teams with patients. It supports emergency and non-emergency requests, role-based authentication, browser GPS, Leaflet maps, and Socket.IO events.
+ResQNow is a Flask prototype for coordinating verified ambulance teams with patients, using SQLite and Socket.IO locally and PostgreSQL, Supabase Storage, and Pusher Channels on Vercel. It supports emergency and non-emergency requests, role-based authentication, browser GPS, and Leaflet maps.
 
 The platform also includes a rule-based Smart Dispatch Score, driver reliability and GPS health signals, timestamped emergency timelines, hospital capacity data, anonymized demand intelligence, admin dispatch override, and clearly labelled DEMO/SIMULATION controls. These intelligence features are research aids, not medical diagnosis, official verification, live traffic data, or a replacement for India's 112/108 services.
 
@@ -16,6 +16,17 @@ python app.py
 
 Open http://127.0.0.1:5000.
 
+## Deploy to Vercel
+
+Vercel serves the Flask application through `api/index.py`. Configure these project environment variables in Vercel:
+
+- `RESQNOW_SECRET_KEY`: a long, randomly generated secret.
+- `DATABASE_URL`: a persistent PostgreSQL connection URL. The app adapts PostgreSQL URLs to its installed psycopg 3 driver.
+- `REALTIME_PROVIDER=pusher`, plus `PUSHER_APP_ID`, `PUSHER_KEY`, `PUSHER_SECRET`, and `PUSHER_CLUSTER` from a Pusher Channels app.
+- `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`, plus `SUPABASE_STORAGE_BUCKET` (defaults to `driver-documents`).
+
+Create the named bucket in Supabase and keep it private. The service-role key is used only by the server and must never be added to browser configuration. Set the Vercel environment variables for every deployment environment and redeploy after changing them. Local development continues to use Socket.IO and local uploads unless the corresponding hosted services are configured.
+
 For an operations account, create one explicitly with credentials held in environment variables:
 
 ```powershell
@@ -30,7 +41,7 @@ $env:RESQNOW_ADMIN_PASSWORD = "use-a-long-unique-password"
 2. Driver verification starts as `UNDER_REVIEW`. For local testing, change the driver's `verification_status` to `VERIFIED` using an authenticated admin review flow or the database inspection tools. Only verified, online, available drivers appear in emergency search.
 
 3. In window two, register a patient, sign in, select Emergency, allow GPS, and search. Submit a request to the driver.
-4. Accept the request in the driver dashboard. The patient receives `booking_accepted` and `tracking_started` over Socket.IO. Send location updates with the driver's browser GPS watcher.
+4. Accept the request in the driver dashboard. The patient receives `booking_accepted` and `tracking_started` over Socket.IO locally or Pusher Channels on Vercel. Send location updates with the driver's browser GPS watcher.
 5. Use booking status updates to move through `EN_ROUTE`, `ARRIVED`, and `COMPLETED`. Completion stops tracking and returns the ambulance to `AVAILABLE`.
 6. Repeat with Non-emergency. It creates a booking but never starts tracking.
 

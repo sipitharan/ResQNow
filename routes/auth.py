@@ -1,8 +1,10 @@
 from datetime import datetime
 import hashlib
+from io import BytesIO
 from pathlib import Path
 import re
 import secrets
+import tempfile
 
 from flask import Blueprint, current_app, flash, jsonify, redirect, render_template, request, send_file, session, url_for
 from flask_login import login_user, logout_user
@@ -11,6 +13,7 @@ from werkzeug.utils import secure_filename
 
 from extensions import limiter
 from models import Ambulance, AuditLog, Driver, Patient, User, VerificationRecord, db
+from services.supabase_storage import download_private_object, is_configured, upload_private_object
 from services.verification import assess_driver
 
 auth_bp = Blueprint("auth", __name__)
@@ -108,7 +111,8 @@ def register():
         if extension not in current_app.config["UPLOAD_EXTENSIONS"] or photo.mimetype not in current_app.config["UPLOAD_MIME_TYPES"]:
             flash("Upload a JPG, JPEG, PNG, or WEBP image.", "error")
             return render_template("register.html")
-        upload_dir = Path(current_app.instance_path) / "secure_uploads"
+        remote_storage = is_configured()
+        upload_dir = Path(tempfile.gettempdir()) / "resqnow-uploads" if remote_storage else Path(current_app.instance_path) / "secure_uploads"
         upload_dir.mkdir(parents=True, exist_ok=True)
         photo_name = f"driver-{secrets.token_hex(16)}{extension}"
         photo_path = upload_dir / photo_name
@@ -126,8 +130,12 @@ def register():
         db.session.add(driver)
         db.session.flush()
         db.session.add(Ambulance(driver_id=driver.id, number=ambulance_number, ambulance_type=ambulance_type))
-        from services.verification import assess_driver
         result = assess_driver(driver, photo_name, str(photo_path), ambulance_number)
+        if remote_storage:
+            try:
+                upload_private_object(photo_name, photo_path, photo.mimetype)
+            finally:
+                photo_path.unlink(missing_ok=True)
         driver.ai_result = result["ai_result"]
         driver.ai_confidence = result["confidence"]
         driver.ai_risk_score = result["risk_score"]
@@ -151,6 +159,9 @@ def driver_photo(driver_id):
     if not current_user.is_authenticated or current_user.role != "ADMIN":
         return jsonify(error="Forbidden"), 403
     driver = db.session.get(Driver, driver_id)
+    if driver and driver.photo_path and is_configured():
+        content, content_type = download_private_object(driver.photo_path)
+        return send_file(BytesIO(content), mimetype=content_type, max_age=0)
     path = Path(current_app.instance_path) / "secure_uploads" / (driver.photo_path if driver else "")
     if not driver or not driver.photo_path or not path.is_file():
         return jsonify(error="Photo not found"), 404

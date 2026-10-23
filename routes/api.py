@@ -1,11 +1,12 @@
 from datetime import datetime
 from functools import wraps
+import re
 
 from flask import Blueprint, current_app, jsonify, request
 from flask_login import current_user, login_required
 from flask_socketio import emit, join_room
 
-from extensions import socketio
+from extensions import emit_realtime, get_pusher_client, socketio
 from models import Ambulance, AuditLog, Booking, BookingEvent, BookingStatus, BookingType, DispatchDecision, Driver, DriverLocation, Hospital, HospitalStatus, Notification, RiskFlag, VerificationStatus, db
 from services.dispatch_engine import recommend_ambulances
 from services.routing_service import get_routing_provider
@@ -31,12 +32,139 @@ def role_required(*roles):
     return decorator
 
 
+@api_bp.post("/pusher/auth")
+@login_required
+def pusher_auth():
+    if current_app.config["REALTIME_PROVIDER"] != "pusher":
+        return jsonify(error="Pusher authentication is not enabled"), 404
+    channel = request.form.get("channel_name", "")
+    socket_id = request.form.get("socket_id", "")
+    match = re.fullmatch(r"private-(driver|patient)-(\d+)", channel)
+    if not match or not socket_id or not current_user.is_active:
+        return jsonify(error="Forbidden"), 403
+
+    profile_type, profile_id = match.groups()
+    if profile_type == "driver":
+        allowed = current_user.role == "DRIVER" and current_user.driver_profile and current_user.driver_profile.id == int(profile_id)
+    else:
+        allowed = current_user.role == "PATIENT" and current_user.patient_profile and current_user.patient_profile.id == int(profile_id)
+    if not allowed:
+        return jsonify(error="Forbidden"), 403
+
+    pusher_client = get_pusher_client()
+    if pusher_client is None:
+        raise RuntimeError("Pusher is not initialized")
+    return jsonify(pusher_client.authenticate(channel, socket_id))
+
+
+@api_bp.post("/driver/status")
+@role_required("DRIVER")
+def update_driver_status():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify(error="A JSON object is required"), 400
+    online = data.get("online")
+    if not isinstance(online, bool):
+        return jsonify(error="An online boolean is required"), 400
+    result, status_code = _set_driver_online(current_user.driver_profile, online)
+    return jsonify(result), status_code
+
+
+@api_bp.post("/driver/location")
+@role_required("DRIVER")
+def update_driver_location():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify(error="A JSON object is required"), 400
+    result, status_code = _process_driver_location(current_user.driver_profile, data)
+    return jsonify(result), status_code
+
+
 def booking_payload(booking):
     return {"id": booking.id, "type": booking.booking_type, "priority": booking.priority, "category": booking.emergency_category, "status": booking.status, "driver_name": booking.driver.user.name, "driver_mobile": booking.driver.user.mobile, "ambulance_number": booking.ambulance.number, "ambulance_type": booking.ambulance.ambulance_type, "patient_latitude": booking.pickup_latitude, "patient_longitude": booking.pickup_longitude, "eta_minutes": booking.eta_minutes, "distance_km": booking.distance_km, "dispatch_score": booking.smart_dispatch_score, "requested_at": booking.requested_at.isoformat() if booking.requested_at else None, "accepted_at": booking.accepted_at.isoformat() if booking.accepted_at else None}
 
 
 def add_booking_event(booking, actor_user_id, event_type):
     db.session.add(BookingEvent(booking_id=booking.id, actor_user_id=actor_user_id, event_type=event_type))
+
+
+def _set_driver_online(driver, online):
+    if online and (driver.verification_status != VerificationStatus.VERIFIED.value or not current_user.is_active):
+        return {"error": "Only active, verified drivers can go online"}, 409
+    driver.is_online = online
+    if not online:
+        driver.latitude = None
+        driver.longitude = None
+    db.session.commit()
+    return {"ok": True, "online": online}, 200
+
+
+def _process_driver_location(driver, data):
+    if not isinstance(data, dict):
+        return {"error": "A JSON object is required"}, 400
+    if not driver.is_online:
+        return {"error": "Go online before sharing GPS"}, 409
+    try:
+        latitude, longitude = float(data["latitude"]), float(data["longitude"])
+    except (KeyError, TypeError, ValueError):
+        return {"error": "Valid GPS coordinates are required"}, 400
+    if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+        driver.gps_status = "LOST"
+        driver.gps_anomaly_count = (driver.gps_anomaly_count or 0) + 1
+        db.session.commit()
+        return {"error": "GPS coordinates are outside the valid range"}, 400
+
+    booking_id = data.get("booking_id")
+    if booking_id is not None:
+        try:
+            booking_id = int(booking_id)
+        except (TypeError, ValueError):
+            return {"error": "Invalid booking ID"}, 400
+        booking = db.session.get(Booking, booking_id)
+        if not booking or booking.driver_id != driver.id:
+            return {"error": "Booking does not belong to this driver"}, 403
+
+    now = datetime.utcnow()
+    if driver.latitude is not None and driver.longitude is not None and driver.last_gps_at:
+        elapsed = max((now - driver.last_gps_at).total_seconds(), 1)
+        jump = distance_km(driver.latitude, driver.longitude, latitude, longitude)
+        if jump / (elapsed / 3600) > 180:
+            driver.gps_status = "STALE"
+            driver.gps_anomaly_count = (driver.gps_anomaly_count or 0) + 1
+            db.session.commit()
+            return {"error": "GPS movement was flagged as anomalous"}, 400
+
+    driver.latitude, driver.longitude = latitude, longitude
+    driver.last_gps_at, driver.gps_status = now, "LIVE"
+    db.session.add(DriverLocation(
+        driver_id=driver.id,
+        booking_id=booking_id,
+        latitude=latitude,
+        longitude=longitude,
+        speed=data.get("speed"),
+        heading=data.get("heading"),
+        accuracy=data.get("accuracy"),
+        gps_status="LIVE",
+    ))
+    db.session.commit()
+
+    if booking_id:
+        booking = db.session.get(Booking, booking_id)
+    else:
+        booking = Booking.query.filter_by(driver_id=driver.id, booking_type="EMERGENCY").filter(
+            Booking.status.in_(["ACCEPTED", "EN_ROUTE", "ARRIVED"])
+        ).first()
+    if booking and booking.driver_id == driver.id and booking.booking_type == "EMERGENCY" and booking.status in {"ACCEPTED", "EN_ROUTE", "ARRIVED"}:
+        emit_realtime("ambulance_location_update", {
+            "booking_id": booking.id,
+            "latitude": latitude,
+            "longitude": longitude,
+            "speed": data.get("speed"),
+            "heading": data.get("heading"),
+            "accuracy": data.get("accuracy"),
+            "timestamp": datetime.utcnow().isoformat(),
+        }, room=f"patient:{booking.patient_id}")
+    return {"ok": True}, 200
 
 
 @api_bp.post("/location")
@@ -85,7 +213,7 @@ def create_booking():
     db.session.add(DispatchDecision(booking_id=booking.id, driver_id=driver.id, score=booking.smart_dispatch_score or 0, reason="[\"ETA\", \"distance\", \"capability\", \"reliability\", \"GPS freshness\", \"workload\"]"))
     db.session.add(Notification(user_id=driver.user_id, message=f"New {booking_type.replace('_', ' ').lower()} request #{booking.id}"))
     db.session.commit()
-    socketio.emit("emergency_request_received", {"booking": booking_payload(booking)}, room=f"driver:{driver.id}")
+    emit_realtime("emergency_request_received", {"booking": booking_payload(booking)}, room=f"driver:{driver.id}")
     return jsonify(booking=booking_payload(booking)), 201
 
 
@@ -133,9 +261,9 @@ def decision(booking_id):
             db.session.add(Notification(user_id=alternative_driver.user_id, message=f"Fallback emergency request #{booking.id} requires a response."))
             db.session.add(Notification(user_id=booking.patient.user_id, message="The first ambulance declined. ResQNow is searching for an alternative."))
     db.session.commit()
-    socketio.emit("booking_accepted" if accept else "booking_rejected", {"booking": booking_payload(booking)}, room=f"patient:{booking.patient_id}")
+    emit_realtime("booking_accepted" if accept else "booking_rejected", {"booking": booking_payload(booking)}, room=f"patient:{booking.patient_id}")
     if accept and booking.booking_type == BookingType.EMERGENCY.value:
-        socketio.emit("tracking_started", {"booking": booking_payload(booking)}, room=f"patient:{booking.patient_id}")
+        emit_realtime("tracking_started", {"booking": booking_payload(booking)}, room=f"patient:{booking.patient_id}")
     return jsonify(booking=booking_payload(booking), fallback_found=bool(fallback))
 
 
@@ -159,10 +287,10 @@ def update_booking_status(booking_id):
         current_user.driver_profile.cancellation_rate = min(100, (current_user.driver_profile.cancellation_rate or 0) + 5)
     if status_value in {"COMPLETED", "CANCELLED"}:
         booking.ambulance.status = "AVAILABLE"
-        socketio.emit("tracking_stopped", {"booking_id": booking.id}, room=f"patient:{booking.patient_id}")
+        emit_realtime("tracking_stopped", {"booking_id": booking.id}, room=f"patient:{booking.patient_id}")
     add_booking_event(booking, current_user.id, status_value)
     db.session.commit()
-    socketio.emit("booking_status_changed", {"booking": booking_payload(booking)}, room=f"patient:{booking.patient_id}")
+    emit_realtime("booking_status_changed", {"booking": booking_payload(booking)}, room=f"patient:{booking.patient_id}")
     return jsonify(booking=booking_payload(booking))
 
 
@@ -242,7 +370,7 @@ def manual_dispatch_override(booking_id):
     add_booking_event(booking, current_user.id, "ADMIN_MANUAL_OVERRIDE")
     db.session.add(Notification(user_id=driver.user_id, message=f"Admin assigned emergency request #{booking.id}."))
     db.session.commit()
-    socketio.emit("emergency_request_received", {"booking": booking_payload(booking)}, room=f"driver:{driver.id}")
+    emit_realtime("emergency_request_received", {"booking": booking_payload(booking)}, room=f"driver:{driver.id}")
     return jsonify(booking=booking_payload(booking), manual_override=True)
 
 
@@ -337,44 +465,14 @@ def driver_online(data=None):
 @socketio.on("driver_offline")
 def driver_offline(data=None):
     if current_user.is_authenticated and current_user.role == "DRIVER":
-        current_user.driver_profile.is_online = False
-        current_user.driver_profile.latitude = None
-        current_user.driver_profile.longitude = None
-        db.session.commit()
+        _set_driver_online(current_user.driver_profile, False)
 
 
 @socketio.on("driver_location_update")
 def driver_location_update(data):
     if not current_user.is_authenticated or current_user.role != "DRIVER":
         return
-    driver = current_user.driver_profile
-    if not driver.is_online:
-        return
-    try:
-        latitude, longitude = float(data["latitude"]), float(data["longitude"])
-    except (KeyError, TypeError, ValueError):
-        return
-    if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
-        driver.gps_status = "LOST"
-        driver.gps_anomaly_count = (driver.gps_anomaly_count or 0) + 1
-        db.session.commit()
-        return
-    now = datetime.utcnow()
-    if driver.latitude is not None and driver.longitude is not None and driver.last_gps_at:
-        elapsed = max((now - driver.last_gps_at).total_seconds(), 1)
-        jump = distance_km(driver.latitude, driver.longitude, latitude, longitude)
-        if jump / (elapsed / 3600) > 180:
-            driver.gps_status = "STALE"
-            driver.gps_anomaly_count = (driver.gps_anomaly_count or 0) + 1
-            db.session.commit()
-            return
-    driver.latitude, driver.longitude = latitude, longitude
-    driver.last_gps_at, driver.gps_status = now, "LIVE"
-    db.session.add(DriverLocation(driver_id=driver.id, booking_id=data.get("booking_id"), latitude=latitude, longitude=longitude, speed=data.get("speed"), heading=data.get("heading"), accuracy=data.get("accuracy"), gps_status="LIVE"))
-    db.session.commit()
-    booking = db.session.get(Booking, data.get("booking_id")) if data.get("booking_id") else Booking.query.filter_by(driver_id=driver.id, booking_type="EMERGENCY").filter(Booking.status.in_(["ACCEPTED", "EN_ROUTE", "ARRIVED"])).first()
-    if booking and booking.driver_id == driver.id and booking.booking_type == "EMERGENCY" and booking.status in {"ACCEPTED", "EN_ROUTE", "ARRIVED"}:
-        socketio.emit("ambulance_location_update", {"booking_id": booking.id, "latitude": latitude, "longitude": longitude, "speed": data.get("speed"), "heading": data.get("heading"), "accuracy": data.get("accuracy"), "timestamp": datetime.utcnow().isoformat()}, room=f"patient:{booking.patient_id}")
+    _process_driver_location(current_user.driver_profile, data)
 
 
 @socketio.on("join_tracking")

@@ -3,7 +3,7 @@ from flask_login import LoginManager
 
 from config import Config
 from models import db, User
-from extensions import limiter, socketio
+from extensions import initialize_realtime, limiter, socketio
 
 login_manager = LoginManager()
 
@@ -81,10 +81,6 @@ def _ensure_schema():
                     connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {definition}"))
             if table == "users" and "updated_at" not in existing:
                 connection.execute(text("UPDATE users SET updated_at = created_at WHERE updated_at IS NULL"))
-        if "patients" in inspector.get_table_names():
-            connection.execute(text("UPDATE patients SET latitude = NULL, longitude = NULL"))
-
-
 def create_app():
     app = Flask(__name__, instance_relative_config=True)
     app.config.from_object(Config)
@@ -92,11 +88,14 @@ def create_app():
     login_manager.init_app(app)
     login_manager.login_view = "auth.login"
     limiter.init_app(app)
-    socketio.init_app(app)
+    if app.config["REALTIME_PROVIDER"] == "socketio":
+        socketio.init_app(app)
+    initialize_realtime(app)
 
     with app.app_context():
         db.create_all()
         _ensure_schema()
+
 
     @app.get("/health")
     def health():
